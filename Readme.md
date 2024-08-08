@@ -24,7 +24,7 @@ for i in {1..15}; do curl -X POST http://localhost:8080 -d "Lorem ipsum dolor si
 ```
 
 더미 노드 서버의 스펙은 다음과 같이 하드코딩되어 있습니다.
-```json
+```GO
 [
   { ID: 1, URL: "http://localhost:8081", ReqLimit: 2, BodyLimit: 123},
   { ID: 2, URL: "http://localhost:8082", ReqLimit: 5, BodyLimit: 2 * 1024 * 1024},
