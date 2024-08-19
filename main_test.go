@@ -7,12 +7,14 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jonboulle/clockwork"
 )
 
 var (
 	client    = &http.Client{}
 	lbServer  *httptest.Server
-	lb        *LoadBalancer
+	lb       = &LoadBalancer{}
 	servers   []*http.Server
 	nodeParams     = []NodeParams{
 		{ID: 1, URL: "http://localhost:8081", ReqLimit: 2, BodyLimit: 76},
@@ -38,18 +40,10 @@ func setup() {
 	for _, nodeParams := range nodeParams {
 		server := startTestServer(8080 + nodeParams.ID)
 		servers = append(servers, server)
-	}
-
-	time.Sleep(1 * time.Second)
-
-	lb = &LoadBalancer{}
-
-	for _, nodeParams := range nodeParams {
 		lb.AddNode(NewNode(nodeParams))
 	}
-
 	lbServer = httptest.NewServer(lb)
-	println(lbServer.URL)
+	time.Sleep(1 * time.Second)
 }
 
 
@@ -91,11 +85,12 @@ func TestLoadBalancer(t *testing.T) {
 // Should work by round robin
 func testRoundRobin(t *testing.T) {
 	next := lb.Next
-	for i := 0; i <= 4; i++ {
+
+	for i := 0; i <= len(lb.Nodes) + 1; i++ {
 		node := lb.Nodes[next]
 
-		if node.ID != next + 1 {
-			t.Errorf("Round robin not working %d, %d", node.ID, next)
+		if node.ID != next+1 {
+			t.Errorf("Round robin not working correctly, expected %d, got %d", next+1, node.ID)
 		}
 		next = (next + 1) % len(lb.Nodes)
 	}
@@ -103,6 +98,7 @@ func testRoundRobin(t *testing.T) {
 
 // Should hit rate limit by requests per minute for each node
 func testRateLimitExceededByRPM(t *testing.T) {
+	resetRateLimits(lb)
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -133,9 +129,9 @@ func testRateLimitExceededByBPM(t *testing.T) {
 func testAllNodesUnhealthy(t *testing.T) {
 	resetRateLimits(lb)
 
-	lb.Nodes[0].Healthy = false
-	lb.Nodes[1].Healthy = false
-	lb.Nodes[2].Healthy = false
+	for _, node := range lb.Nodes {
+		node.Healthy = false
+	}
 
 	resp, err := client.Get(lbServer.URL)
 
@@ -164,14 +160,27 @@ func testAllNodesBusy(t *testing.T) {
 
 // Should reset RPM and BPM for each node every minute
 func testRateLimitReset(t *testing.T) {
-	time.Sleep(61 * time.Second) // TODO: replace with fake timer
+	c := clockwork.NewFakeClock()
 
-	for i := 0; i < 3; i++ {
-		if lb.Nodes[i].ReqCount > 0 {
-			t.Errorf("ReqCount should reset to %d, got %d", 0, lb.Nodes[i].ReqCount)
-		}
-		if lb.Nodes[i].BodyCount > 0 {
-			t.Errorf("ReqCount should reset to %d, got %d", 0, lb.Nodes[i].ReqCount)
-		}
+	lb2 := NewLoadBalancer(c)
+	node := NewNode(nodeParams[0])
+	lb2.AddNode(node)
+
+	node.ReqCount = 10
+	node.BodyCount = 100
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		lb2.StartPeriodicTasks()
+		c.Advance(61 * time.Second)
+		wg.Done()
+	}()
+	c.BlockUntil(1)
+
+	wg.Wait()
+
+	if node.ReqCount != 0 || node.BodyCount != 0 {
+		t.Errorf("Expected counters to be reset to 0, got ReqCount=%d, BodyCount=%d", node.ReqCount, node.BodyCount)
 	}
 }
