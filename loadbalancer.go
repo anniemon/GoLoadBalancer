@@ -4,12 +4,25 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
+
+	"github.com/jonboulle/clockwork"
 )
 
 type LoadBalancer struct {
 	Nodes []*Node
 	Next  int
 	Mutex sync.Mutex
+	Clock clockwork.Clock
+}
+
+func NewLoadBalancer(clock clockwork.Clock) *LoadBalancer {
+	return &LoadBalancer{
+		Nodes: []*Node{},
+		Next:  0,
+		Mutex: sync.Mutex{},
+		Clock: clock,
+	}
 }
 
 func (lb *LoadBalancer) AddNode(node *Node) {
@@ -71,4 +84,42 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log.Println("No available node")
 	http.Error(w, "No available node", http.StatusServiceUnavailable)
+}
+
+func (lb *LoadBalancer) StartPeriodicTasks() {
+	lb.Clock.AfterFunc(1*time.Minute, lb.resetLimits)
+	lb.Clock.AfterFunc(30*time.Second, lb.checkHealth)
+}
+
+func (lb *LoadBalancer) resetLimits() {
+	for _, node := range lb.Nodes {
+		node.Mutex.Lock()
+		node.ReqCount = 0
+		node.BodyCount = 0
+		node.Mutex.Unlock()
+	}
+	lb.Clock.AfterFunc(1*time.Minute, lb.resetLimits)
+}
+
+func (lb *LoadBalancer) checkHealth() {
+	for _, node := range lb.Nodes {
+		go func(n *Node) {
+			resp, err := http.Get(n.URL + "/health")
+			n.Mutex.Lock()
+
+			if err != nil || resp.StatusCode != http.StatusOK {
+				n.Healthy = false
+				log.Printf("Node %d (%s) is unhealthy\n", node.ID, node.URL)
+
+			} else {
+				n.Healthy = true
+				log.Printf("Node %d (%s) is healthy\n", node.ID, node.URL)
+			}
+			n.Mutex.Unlock()
+			if resp != nil {
+				resp.Body.Close()
+			}
+		}(node)
+	}
+	lb.Clock.AfterFunc(30*time.Second, lb.checkHealth)
 }
