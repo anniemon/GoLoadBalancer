@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 func startBackendServer(id int, targetURL string) {
@@ -27,7 +28,7 @@ func startBackendServer(id int, targetURL string) {
 		w.WriteHeader(http.StatusOK)
 	})
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", 8080+id),
+		Addr:    fmt.Sprintf(":%s", strings.Split(targetURL, ":")[2]),
 		Handler: mux,
 	}
 	log.Printf("Starting node %d on port %d", id, 8080+id)
