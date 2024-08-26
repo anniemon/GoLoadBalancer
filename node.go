@@ -3,25 +3,23 @@ package main
 import (
 	"net/http/httputil"
 	"net/url"
-	"sync"
 )
 
 type NodeParams struct {
 	ID        int
 	URL       string
-	ReqLimit  int
-	BodyLimit int
+	ReqLimit  uint32
+	BodyLimit uint64
 }
 
 type Node struct {
 	ID         int
 	URL        string
-	ReqLimit   int
-	BodyLimit  int
-	ReqCount   int
-	BodyCount  int
-	Healthy    bool
-	Mutex      sync.Mutex
+	ReqLimit   uint32
+	BodyLimit  uint64
+	ReqCount   uint32
+	BodyCount  uint64
+	Healthy    uint32
 	ReverseProxy *httputil.ReverseProxy
 }
 
@@ -34,15 +32,8 @@ func NewNode(params NodeParams) *Node {
 		URL:       params.URL,
 		ReqLimit:  params.ReqLimit,
 		BodyLimit: params.BodyLimit,
-		Healthy:   true,
+		Healthy:   1,
 		ReverseProxy: rp,
 	}
 	return node
-}
-
-func (n *Node) ResetLimits() {
-	n.Mutex.Lock()
-	defer n.Mutex.Unlock()
-	n.ReqCount = 0
-	n.BodyCount = 0
 }

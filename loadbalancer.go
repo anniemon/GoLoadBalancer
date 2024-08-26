@@ -3,123 +3,123 @@ package main
 import (
 	"log"
 	"net/http"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jonboulle/clockwork"
 )
 
+// TODO: refactor to separate NodeManager file
+type NodeManager interface {
+	GetNextNode() *Node
+	isRateLimitExceeded(node *Node, bodyLen int) bool
+	ResetLimits()
+	CheckHealth()
+}
+
+type SafeNodeManager struct {
+	nodes []*Node
+	next  int32
+	clock clockwork.Clock
+}
+
 type LoadBalancer struct {
-	Nodes []*Node
-	Next  int
-	Mutex sync.Mutex
-	Clock clockwork.Clock
+	manager NodeManager
 }
 
-func NewLoadBalancer(clock clockwork.Clock) *LoadBalancer {
-	return &LoadBalancer{
-		Nodes: []*Node{},
-		Next:  0,
-		Mutex: sync.Mutex{},
-		Clock: clock,
+func NewSafeNodeManager(nodes []*Node, clock clockwork.Clock) *SafeNodeManager {
+	return &SafeNodeManager{
+			nodes: nodes,
+			next:  0,
+			clock: clock,
 	}
 }
 
-func (lb *LoadBalancer) AddNode(node *Node) {
-	lb.Nodes = append(lb.Nodes, node)
-}
+func (m *SafeNodeManager) GetNextNode() *Node {
+	idx := atomic.AddInt32(&m.next, 1) % int32(len(m.nodes))
+	node := m.nodes[idx]
 
-func (lb *LoadBalancer) GetNextNode() *Node {
-	lb.Mutex.Lock()
-	defer lb.Mutex.Unlock()
-
-	node := lb.Nodes[lb.Next]
-	lb.Next = (lb.Next + 1) % len(lb.Nodes)
-
-	if node.Healthy {
-		return node
+	if node.Healthy == 1 {
+			return node
 	}
 
-	log.Printf("Skipping unhealthy node %d (%s)",
-			node.ID, node.URL)
+	log.Printf("Skipping unhealthy node %d (%s)", node.ID, node.URL)
 	return nil
 }
 
-func isRateLimitExceeded(node *Node, bodyLen int) (bool) {
-	if node.ReqCount >= node.ReqLimit || node.BodyCount+bodyLen > node.BodyLimit {
-		return true
+func (m *SafeNodeManager) isRateLimitExceeded(node *Node, bodyLen int) bool {
+	if atomic.LoadUint32(&node.ReqCount) >= node.ReqLimit ||
+		atomic.LoadUint64(&node.BodyCount)+uint64(bodyLen) > node.BodyLimit {
+			log.Printf("Rate limit hit for node %d (%s) - RPM: %d/%d, BodyLimit: %d, RequestBody: %d\n",
+			node.ID, node.URL, node.ReqCount, node.ReqLimit, node.BodyLimit, bodyLen)
+			return true
 	}
+
+	atomic.AddUint32(&node.ReqCount, 1)
+	atomic.AddUint64(&node.BodyCount, uint64(bodyLen))
+	
 	return false
+}
+
+func (m *SafeNodeManager) ResetLimits() {
+	for _, node := range m.nodes {
+			atomic.StoreUint32(&node.ReqCount, 0)
+			atomic.StoreUint64(&node.BodyCount, 0)
+	}
+}
+
+func (m *SafeNodeManager) CheckHealth() {
+	for _, node := range m.nodes {
+			go func(n *Node) {
+					resp, err := http.Get(n.URL + "/health")
+
+					if err != nil || resp.StatusCode != http.StatusOK {
+							atomic.StoreUint32(&n.Healthy, 0)
+							log.Printf("Node %d (%s) is unhealthy\n", n.ID, n.URL)
+					} else {
+							atomic.StoreUint32(&n.Healthy, 1)
+							log.Printf("Node %d (%s) is healthy\n", n.ID, n.URL)
+					}
+
+					if resp != nil {
+							resp.Body.Close()
+					}
+			}(node)
+	}
+}
+
+func NewLoadBalancer(manager NodeManager) *LoadBalancer {
+	return &LoadBalancer{
+			manager: manager,
+	}
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bodyLen := int(r.ContentLength)
+  nodeLen := len(lb.manager.(*SafeNodeManager).nodes)
 
-	for i := 0; i < len(lb.Nodes); i++ {
-		node := lb.GetNextNode()
+	var node *Node
+	for i := 0; i < nodeLen; i++ {
+			node = lb.manager.GetNextNode()
+			if node == nil {
+					continue
+			}
 
-		if node == nil {
-			continue
-		}
+			if lb.manager.isRateLimitExceeded(node, bodyLen) {
+					continue
+			}
 
-		node.Mutex.Lock()
-		defer node.Mutex.Unlock()
+			log.Printf("Forwarding request to node %d (%s)\n - RPM: %d/%d, BPM: %d/%d\n",
+			node.ID, node.URL, node.ReqCount, node.ReqLimit, node.BodyCount, node.BodyLimit)
 
-		if isRateLimitExceeded(node, bodyLen) {
-			log.Printf("Rate limit hit for node %d (%s) - RPM: %d/%d, BodyLimit: %d, RequestBody: %d\n",
-			node.ID, node.URL, node.ReqCount, node.ReqLimit, node.BodyLimit, bodyLen)
-
-			continue
-		}
-
-		node.ReqCount++
-		node.BodyCount += bodyLen
-
-		log.Printf("Forwarding request to node %d (%s) - RPM: %d/%d, BPM: %d/%d\n",
-		node.ID, node.URL, node.ReqCount, node.ReqLimit, node.BodyCount, node.BodyLimit)
-
-		node.ReverseProxy.ServeHTTP(w, r)
-		return
+			node.ReverseProxy.ServeHTTP(w, r)
+			return;
 	}
 
-	log.Println("No available node")
 	http.Error(w, "No available node", http.StatusServiceUnavailable)
 }
 
-func (lb *LoadBalancer) StartPeriodicTasks() {
-	lb.Clock.AfterFunc(1*time.Minute, lb.resetLimits)
-	lb.Clock.AfterFunc(30*time.Second, lb.checkHealth)
-}
-
-func (lb *LoadBalancer) resetLimits() {
-	for _, node := range lb.Nodes {
-		node.Mutex.Lock()
-		node.ReqCount = 0
-		node.BodyCount = 0
-		node.Mutex.Unlock()
-	}
-	lb.Clock.AfterFunc(1*time.Minute, lb.resetLimits)
-}
-
-func (lb *LoadBalancer) checkHealth() {
-	for _, node := range lb.Nodes {
-		go func(n *Node) {
-			resp, err := http.Get(n.URL + "/health")
-			n.Mutex.Lock()
-
-			if err != nil || resp.StatusCode != http.StatusOK {
-				n.Healthy = false
-				log.Printf("Node %d (%s) is unhealthy\n", node.ID, node.URL)
-
-			} else {
-				n.Healthy = true
-				log.Printf("Node %d (%s) is healthy\n", node.ID, node.URL)
-			}
-			n.Mutex.Unlock()
-			if resp != nil {
-				resp.Body.Close()
-			}
-		}(node)
-	}
-	lb.Clock.AfterFunc(30*time.Second, lb.checkHealth)
+func (m *SafeNodeManager) StartPeriodicTasks() {
+	m.clock.AfterFunc(1*time.Minute, m.ResetLimits)
+	m.clock.AfterFunc(30*time.Second, m.CheckHealth)
 }
